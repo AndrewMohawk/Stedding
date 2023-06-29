@@ -19,6 +19,8 @@ contract Stedding is ChainlinkClient, Ownable, ReentrancyGuard {
     uint256 public projectDomainCount;
     address public linkTokenAddress;
     string[] public entryKeys;
+    string[] public projectDomainKeys;
+
 
     // Struct representing an entry in the allowlist
     struct Entry {
@@ -36,6 +38,14 @@ contract Stedding is ChainlinkClient, Ownable, ReentrancyGuard {
         string newComment;
     }
 
+    // New struct for storing project domain information
+struct ProjectDomain {
+    string domain;
+    string description;
+    bool isValid;
+}
+
+mapping(string => ProjectDomain) public projectDomains;
     mapping(string => Entry) public allowList;
     mapping(bytes32 => string) public requestIdToEntry;
     mapping(string => bool) public isValidProjectDomain;
@@ -53,30 +63,81 @@ contract Stedding is ChainlinkClient, Ownable, ReentrancyGuard {
         _;
     }
 
-    constructor() Ownable() {
-        address _linkTokenAddress = 0x326C977E6efc84E512bB9C30f76E30c160eD06FB; // TODO: make this a configurable parameter
-        linkTokenAddress = _linkTokenAddress;
-        setChainlinkToken(_linkTokenAddress);
-        setChainlinkOracle(0xB9756312523826A566e222a34793E414A81c88E1);
-        jobId = "791bd73c8a1349859f09b1cb87304f71";
-        oraclePayment = 0.1 * 10 ** 18;
-    }
+    constructor(string memory initialProjectDomain, string memory initialDescription) Ownable() {
+    address _linkTokenAddress = 0x779877A7B0D9E8603169DdbD7836e478b4624789;
+    linkTokenAddress = _linkTokenAddress;
+    setChainlinkToken(_linkTokenAddress);
+    setChainlinkOracle(0x649a2C205BE7A3d5e99206CEEFF30c794f0E31EC);
+    jobId = "791bd73c8a1349859f09b1cb87304f71";
+    oraclePayment = 0.1 * 10 ** 18;
+
+    // Add the initial project domain directly.
+    isValidProjectDomain[initialProjectDomain] = true;
+    projectDomainCount++;
+
+    // Store the domain and description in the mapping
+    projectDomains[initialProjectDomain] = ProjectDomain(initialProjectDomain, initialDescription, true);
+    projectDomainKeys.push(initialProjectDomain);
+
+    emit ProjectDomainAdded(initialProjectDomain);
+}
+
+
 
     function setOraclePayment(uint256 newPayment) external onlyOwner {
         oraclePayment = newPayment;
     }
 
-    function addProjectDomain(string memory projectDomain) external onlyOwner {
-        isValidProjectDomain[projectDomain] = true;
-        projectDomainCount++;
-        emit ProjectDomainAdded(projectDomain);
+    // Modify addProjectDomain function to accept a description and store in mapping
+function addProjectDomain(string memory projectDomain, string memory description) external onlyOwner {
+    isValidProjectDomain[projectDomain] = true;
+    projectDomainCount++;
+
+    // Store the domain and description in the mapping
+    projectDomains[projectDomain] = ProjectDomain(projectDomain, description, true);
+    
+    // Store the domain in the projectDomainKeys array
+    projectDomainKeys.push(projectDomain);
+
+    emit ProjectDomainAdded(projectDomain);
+}
+
+
+// Modify removeProjectDomain function to remove the associated data in mapping
+function removeProjectDomain(string memory projectDomain) external onlyOwner {
+    isValidProjectDomain[projectDomain] = false;
+    projectDomainCount--;
+
+    // Remove the domain information from the mapping
+    delete projectDomains[projectDomain];
+
+    emit ProjectDomainRemoved(projectDomain);
+}
+
+// Getter function to retrieve the list of valid project domains and their descriptions
+function getValidProjectDomains() external view returns (ProjectDomain[] memory) {
+    uint256 count = 0;
+
+    // Count valid project domains
+    for (uint256 i = 0; i < projectDomainKeys.length; i++) {
+        if (projectDomains[projectDomainKeys[i]].isValid) {
+            count++;
+        }
     }
 
-    function removeProjectDomain(string memory projectDomain) external onlyOwner {
-        isValidProjectDomain[projectDomain] = false;
-        projectDomainCount--;
-        emit ProjectDomainRemoved(projectDomain);
+    ProjectDomain[] memory validProjectDomains = new ProjectDomain[](count);
+    uint256 index = 0;
+
+    // Populate array with valid project domains
+    for (uint256 i = 0; i < projectDomainKeys.length; i++) {
+        if (projectDomains[projectDomainKeys[i]].isValid) {
+            validProjectDomains[index] = projectDomains[projectDomainKeys[i]];
+            index++;
+        }
     }
+    return validProjectDomains;
+}
+
 
     function requestDNSVerification(
         string memory entry,
@@ -163,17 +224,33 @@ function DNSVerificationFulfillment(
 }
 
 function updateEntry(
-    string memory entry,
+    string memory oldEntry,
+    string memory newEntry,
     string memory projectDomain,
     string memory newComment
 ) public validProjectDomain(projectDomain) {
-    require(allowList[entry].isVerified, "Entry does not exist");
-    
+    require(allowList[oldEntry].isVerified, "Entry does not exist");
+
     // Check if the sender is the same as the verified address for the entry
     // or if the address can be validated through a DNS lookup.
-    bool isSameAddress = allowList[entry].verifiedAddress == msg.sender;
+    bool isSameAddress = allowList[oldEntry].verifiedAddress == msg.sender;
 
-    if (!isSameAddress) {
+    if (isSameAddress) {
+        // Create a new entry with the updated information
+        allowList[newEntry] = Entry(newEntry, projectDomain, newComment, true, msg.sender);
+        
+        // Remove the old entry
+        delete allowList[oldEntry];
+        
+        // Optionally update entryKeys array, if you are using it elsewhere in your code.
+        for (uint256 i = 0; i < entryKeys.length; i++) {
+            if (keccak256(bytes(entryKeys[i])) == keccak256(bytes(oldEntry))) {
+                entryKeys[i] = newEntry;
+                break;
+            }
+        }
+        emit EntryUpdated(newEntry, newComment);
+    } else {
         LinkTokenInterface(linkTokenAddress).transferFrom(
             msg.sender,
             address(this),
@@ -181,29 +258,21 @@ function updateEntry(
         );
 
         bytes32 requestId = requestDNSVerification(
-            entry,
+            newEntry,
             projectDomain,
             newComment,
             msg.sender
         );
         
         // Store information for the verification in requestIdToEntry to be used in DNSVerificationFulfillment
-        requestIdToEntry[requestId] = entry;
+        requestIdToEntry[requestId] = newEntry;
         
         // Store the new comment for the DNS verification
         dnsVerificationRequests[requestId].newComment = newComment;
-    } else {
-        string memory existingProjectDomain = allowList[entry].projectDomain;
-        require(
-            keccak256(abi.encodePacked(existingProjectDomain)) ==
-                keccak256(abi.encodePacked(projectDomain)),
-            "Project domain mismatch"
-        );
-
-        allowList[entry].comment = newComment;
-        emit EntryUpdated(entry, newComment);
     }
 }
+
+
 
 
 
