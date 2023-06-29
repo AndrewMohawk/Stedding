@@ -6,81 +6,56 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/LinkTokenInterface.sol";
 
+/**
+ * @title Stedding
+ * @dev Allows approved web3 projects to add URLs and domains to an on-chain allowlist. 
+ * Projects must be verified via off-chain DNS lookup against the sender's address.
+ */
 contract Stedding is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
 
     uint256 public oraclePayment;
     bytes32 public jobId;
+    uint256 public projectDomainCount;
+    address public linkTokenAddress;
     string[] public entryKeys;
 
-    address public LINK_TOKEN_ADDRESS;
-
-    enum ProposalType {
-        Add,
-        Remove
-    }
-    enum Vote {
-        None,
-        InFavor,
-        Against
-    }
-
-    struct Proposal {
-        ProposalType proposalType;
-        string rootDomain;
-        uint256 inFavor;
-        uint256 against;
-        mapping(string => Vote) votes; // map rootDomain to Vote
-        bool resolved;
-    }
-
-    uint256 public rootDomainCount;
-    uint256 public proposalCount;
-    mapping(uint256 => Proposal) public proposals;
-
-    // Events
-    event ProposalCreated(
-        uint256 proposalId,
-        ProposalType proposalType,
-        string rootDomain,
-        string creator
-    );
-    event Voted(uint256 proposalId, string voterRootDomain, Vote vote);
-    event ProposalResolved(uint256 proposalId, bool passed);
-
+    // Struct representing an entry in the allowlist
     struct Entry {
         string entry;
-        string rootDomain;
+        string projectDomain;
         string comment;
         bool isVerified;
+        address verifiedAddress; // The address that was verified for this entry
     }
 
-    struct DnsVerificationRequest {
+    // Struct representing a DNS verification request
+    struct DNSVerificationRequest {
         string entry;
         address sender;
+        string newComment;
     }
 
     mapping(string => Entry) public allowList;
     mapping(bytes32 => string) public requestIdToEntry;
-    mapping(string => bool) public isValidRootDomain;
-    mapping(bytes32 => DnsVerificationRequest) public dnsVerificationRequests;
+    mapping(string => bool) public isValidProjectDomain;
+    mapping(bytes32 => DNSVerificationRequest) public dnsVerificationRequests;
 
     event EntryAdded(bytes32 indexed requestId, string entry, string comment);
     event EntryUpdated(string entry, string newComment);
-    event EntryVerified(string entry);
     event EntryVerificationSucceeded(string entry);
     event EntryVerificationFailed(string entry, string reason);
-    event RootDomainAdded(string rootDomain);
-    event RootDomainRemoved(string rootDomain);
+    event ProjectDomainAdded(string projectDomain);
+    event ProjectDomainRemoved(string projectDomain);
 
-    modifier validRootDomain(string memory rootDomain) {
-        require(isValidRootDomain[rootDomain], "Invalid root domain");
+    modifier validProjectDomain(string memory projectDomain) {
+        require(isValidProjectDomain[projectDomain], "Invalid project domain");
         _;
     }
 
     constructor() Ownable() {
-        address _linkTokenAddress = 0x326C977E6efc84E512bB9C30f76E30c160eD06FB;
-        LINK_TOKEN_ADDRESS = _linkTokenAddress;
+        address _linkTokenAddress = 0x326C977E6efc84E512bB9C30f76E30c160eD06FB; // TODO: make this a configurable parameter
+        linkTokenAddress = _linkTokenAddress;
         setChainlinkToken(_linkTokenAddress);
         setChainlinkOracle(0xB9756312523826A566e222a34793E414A81c88E1);
         jobId = "791bd73c8a1349859f09b1cb87304f71";
@@ -91,137 +66,185 @@ contract Stedding is ChainlinkClient, Ownable, ReentrancyGuard {
         oraclePayment = newPayment;
     }
 
-    function addRootDomain(string memory rootDomain) public onlyOwner {
-        require(bytes(rootDomain).length > 0, "Root domain cannot be empty");
-        isValidRootDomain[rootDomain] = true;
-        rootDomainCount++;
-        emit RootDomainAdded(rootDomain);
+    function addProjectDomain(string memory projectDomain) external onlyOwner {
+        isValidProjectDomain[projectDomain] = true;
+        projectDomainCount++;
+        emit ProjectDomainAdded(projectDomain);
     }
 
-    function removeRootDomain(string memory rootDomain) public onlyOwner {
-        require(bytes(rootDomain).length > 0, "Root domain cannot be empty");
-        isValidRootDomain[rootDomain] = false;
-        rootDomainCount--;
-        emit RootDomainRemoved(rootDomain);
+    function removeProjectDomain(string memory projectDomain) external onlyOwner {
+        isValidProjectDomain[projectDomain] = false;
+        projectDomainCount--;
+        emit ProjectDomainRemoved(projectDomain);
     }
 
-    function createProposal(ProposalType proposalType, string memory rootDomain)
-    external
-    validRootDomain(rootDomain)
-{
-    require(bytes(rootDomain).length > 0, "Root domain cannot be empty");
-
-    proposalCount++;
-
-    Proposal storage newProposal = proposals[proposalCount];
-    newProposal.proposalType = proposalType;
-    newProposal.rootDomain = rootDomain;
-    newProposal.inFavor = 0;
-    newProposal.against = 0;
-    newProposal.resolved = false;
-
-    emit ProposalCreated(proposalCount, proposalType, rootDomain, rootDomain);
-}
-
-
-    function vote(uint256 proposalId, Vote voteChoice)
-        external
-        validRootDomain(allowList[entryKeys[0]].rootDomain)
-    {
-        require(proposalId > 0 && proposalId <= proposalCount, "Invalid proposal ID");
-        Proposal storage proposal = proposals[proposalId];
-        require(!proposal.resolved, "Proposal already resolved");
-        require(
-            proposal.votes[allowList[entryKeys[0]].rootDomain] == Vote.None,
-            "Already voted"
-        );
-
-        if (voteChoice == Vote.InFavor) {
-            proposal.inFavor++;
-        } else {
-            proposal.against++;
-        }
-
-        proposal.votes[allowList[entryKeys[0]].rootDomain] = voteChoice;
-        emit Voted(proposalId, allowList[entryKeys[0]].rootDomain, voteChoice);
-
-        // Check resolution
-        if (proposal.inFavor > rootDomainCount / 2) {
-            proposal.resolved = true;
-            emit ProposalResolved(proposalId, true);
-            if (proposal.proposalType == ProposalType.Add) {
-                addRootDomain(proposal.rootDomain);
-            } else {
-                removeRootDomain(proposal.rootDomain);
-            }
-        } else if (proposal.against >= rootDomainCount / 2) {
-            proposal.resolved = true;
-            emit ProposalResolved(proposalId, false);
-        }
-    }
-
-    function addEntry(string memory entry, string memory comment) external {
-        require(bytes(entry).length > 0, "Entry cannot be empty");
-        require(bytes(comment).length > 0, "Comment cannot be empty");
-        
+    function requestDNSVerification(
+        string memory entry,
+        string memory projectDomain,
+        string memory newComment,
+        address sender
+    ) internal returns (bytes32 requestId) {
         Chainlink.Request memory req = buildChainlinkRequest(
             jobId,
             address(this),
-            this.fulfillDnsVerification.selector
+            this.DNSVerificationFulfillment.selector
         );
-        req.add("get", entry);
-        bytes32 requestId = sendChainlinkRequest(req, oraclePayment);
-        requestIdToEntry[requestId] = entry;
-        dnsVerificationRequests[requestId] = DnsVerificationRequest({
-            entry: entry,
-            sender: msg.sender
-        });
-        allowList[entry] = Entry({
-            entry: entry,
-            rootDomain: entry,
-            comment: comment,
-            isVerified: false
-        });
-        entryKeys.push(entry);
-        emit EntryAdded(requestId, entry, comment);
+        req.add("name", projectDomain);
+        req.add("record", addressToString(sender));
+        requestId = sendChainlinkRequest(req, oraclePayment);
+        dnsVerificationRequests[requestId] = DNSVerificationRequest(
+            entry,
+            sender,
+            newComment
+        );
+        return requestId;
     }
 
-    function fulfillDnsVerification(
-        bytes32 requestId,
-        uint256 statusCode,
-        bytes32 data
-    ) external recordChainlinkFulfillment(requestId) {
-        DnsVerificationRequest memory dnsRequest = dnsVerificationRequests[
-            requestId
-        ];
-        string memory entry = dnsRequest.entry;
+function DNSVerificationFulfillment(
+    bytes32 _requestId,
+    bool _isVerified
+) external nonReentrant recordChainlinkFulfillment(_requestId) {
+    DNSVerificationRequest memory dnsRequest = dnsVerificationRequests[
+        _requestId
+    ];
 
-        if (statusCode == 200 && data.length > 0) {
-            allowList[entry].isVerified = true;
-            emit EntryVerificationSucceeded(entry);
-        } else {
-            delete allowList[entry];
-            for (uint256 i = 0; i < entryKeys.length; i++) {
-                if (
-                    keccak256(abi.encodePacked(entryKeys[i])) ==
-                    keccak256(abi.encodePacked(entry))
-                ) {
-                    entryKeys[i] = entryKeys[entryKeys.length - 1];
-                    entryKeys.pop();
-                    break;
-                }
-            }
-            emit EntryVerificationFailed(entry, "DNS Verification Failed");
+    if (_isVerified) {
+        allowList[dnsRequest.entry].isVerified = true;
+        allowList[dnsRequest.entry].verifiedAddress = dnsRequest.sender;
+        emit EntryVerificationSucceeded(dnsRequest.entry);
+
+        // Check if this is an update
+        string memory entry = requestIdToEntry[_requestId];
+        if (bytes(entry).length > 0) {
+            // Use the newComment from the DNSVerificationRequest struct
+            allowList[entry].comment = dnsRequest.newComment;
+            emit EntryUpdated(entry, dnsRequest.newComment);
+            delete requestIdToEntry[_requestId];
         }
-        delete dnsVerificationRequests[requestId];
+    } else {
+        emit EntryVerificationFailed(
+            dnsRequest.entry,
+            "DNS Verification Failed"
+        );
     }
 
-    function updateEntry(string memory entry, string memory newComment)
-        external
-        validRootDomain(allowList[entry].rootDomain)
-    {
-        require(bytes(newComment).length > 0, "Comment cannot be empty");
+    delete dnsVerificationRequests[_requestId];
+}
+
+
+
+    function addEntry(
+    string memory entry,
+    string memory projectDomain,
+    string memory comment
+) public validProjectDomain(projectDomain) {
+    require(!allowList[entry].isVerified, "Entry already exists");
+
+    LinkTokenInterface(linkTokenAddress).transferFrom(
+        msg.sender,
+        address(this),
+        oraclePayment
+    );
+
+    allowList[entry] = Entry(entry, projectDomain, comment, false, address(0));
+
+    // Only add to entryKeys if this is the first time this entry is being added
+    if (allowList[entry].verifiedAddress == address(0)) {
+        entryKeys.push(entry);
+    }
+
+    bytes32 requestId = requestDNSVerification(
+        entry,
+        projectDomain,
+        comment,
+        msg.sender
+    );
+    emit EntryAdded(requestId, entry, comment);
+}
+
+function updateEntry(
+    string memory entry,
+    string memory projectDomain,
+    string memory newComment
+) public validProjectDomain(projectDomain) {
+    require(allowList[entry].isVerified, "Entry does not exist");
+    
+    // Check if the sender is the same as the verified address for the entry
+    // or if the address can be validated through a DNS lookup.
+    bool isSameAddress = allowList[entry].verifiedAddress == msg.sender;
+
+    if (!isSameAddress) {
+        LinkTokenInterface(linkTokenAddress).transferFrom(
+            msg.sender,
+            address(this),
+            oraclePayment
+        );
+
+        bytes32 requestId = requestDNSVerification(
+            entry,
+            projectDomain,
+            newComment,
+            msg.sender
+        );
+        
+        // Store information for the verification in requestIdToEntry to be used in DNSVerificationFulfillment
+        requestIdToEntry[requestId] = entry;
+        
+        // Store the new comment for the DNS verification
+        dnsVerificationRequests[requestId].newComment = newComment;
+    } else {
+        string memory existingProjectDomain = allowList[entry].projectDomain;
+        require(
+            keccak256(abi.encodePacked(existingProjectDomain)) ==
+                keccak256(abi.encodePacked(projectDomain)),
+            "Project domain mismatch"
+        );
+
         allowList[entry].comment = newComment;
         emit EntryUpdated(entry, newComment);
+    }
+}
+
+
+
+    function getValidEntries() public view returns (string[] memory) {
+    uint256 count = 0;
+
+    // Count valid entries
+    for (uint256 i = 0; i < entryKeys.length; i++) {
+        string memory entry = entryKeys[i];
+        if (allowList[entry].isVerified) {
+            count++;
+        }
+    }
+
+    string[] memory validEntries = new string[](count);
+    uint256 index = 0;
+
+    // Populate array with valid entries
+    for (uint256 i = 0; i < entryKeys.length; i++) {
+        string memory entry = entryKeys[i];
+        if (allowList[entry].isVerified) {
+            validEntries[index] = entry;
+            index++;
+        }
+    }
+    return validEntries;
+}
+
+    function addressToString(
+        address _addr
+    ) internal pure returns (string memory) {
+        bytes32 value = bytes32(uint256(uint160(_addr)));
+        bytes memory alphabet = "0123456789abcdef";
+
+        bytes memory str = new bytes(42);
+        str[0] = "0";
+        str[1] = "x";
+        for (uint256 i = 0; i < 20; i++) {
+            str[2 + i * 2] = alphabet[uint8(value[i + 12] >> 4)];
+            str[3 + i * 2] = alphabet[uint8(value[i + 12] & 0x0f)];
+        }
+        return string(str);
     }
 }
